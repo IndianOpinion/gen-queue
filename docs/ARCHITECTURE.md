@@ -40,18 +40,25 @@ refer to the PRD.
    decided, so the existing row is read and returned (or requeued).
 3. **Run.** `Plugin::run()` (WP-Cron tick or `wp gen-queue run`) calls
    `Runner::run()`:
-   1. housekeeping (reclaim, expiry, daily purge), at most 1 s;
-   2. kill switch; then a worker slot row, or stop `busy`;
-   3. per job: fresh switch, cap, pause list, cooling keys and holds; select
+   1. the idle probe: one read for the database clock and whether anything
+      is due, stale or expiring, one read for the switch, cap and purge day;
+      with nothing to do the run stops here (`empty`, `waiting`, `capped`
+      or `disabled`) without taking any lock;
+   2. housekeeping (reclaim, expiry, daily purge), at most 1 s;
+   3. kill switch; then a worker slot row, or stop `busy`;
+   4. per job: fresh switch, cap, pause list, cooling keys and holds; select
       up to 25 candidates in order (priority desc, `run_after` asc, id asc);
-   4. per candidate, under the claim lock: global cap, type cap,
-      `gen_queue_can_run`, spend-meter pre-spend, then the conditional
-      `UPDATE ... SET status = 'running', attempts = attempts + 1 ... WHERE
-      id = ? AND status = 'queued'`;
-   5. insert the attempt row (`started`), fire `gen_queue_claimed`, re-check
+   5. per candidate, under the claim lock: global cap, type cap, a fresh
+      re-check of the row's resource key and group (a cooldown or hold may
+      have started since the candidates were read), `gen_queue_can_run`,
+      spend-meter pre-spend, then the conditional `UPDATE ... SET status =
+      'running', attempts = attempts + 1 ... WHERE id = ? AND status =
+      'queued' AND attempts = ? AND run_after = ?`;
+   6. insert the attempt row (`started`), fire `gen_queue_claimed`, re-check
       the switch and the pause list, call the handler;
-   6. close: one conditional update keyed by the lease token, then the
-      attempt row, breakers and holds, actions, and the cost forward.
+   7. close: for an account error the group hold first, then one
+      conditional update keyed by the lease token, then the attempt row,
+      breakers, actions, and the cost forward.
 4. **Observe.** `Status::snapshot()` feeds the status page, the notices and
    `wp gen-queue status --format=json`.
 
@@ -117,11 +124,18 @@ Where the PRD left a choice open, this is what was built and why.
    cap check under the claim lock so concurrent runners accumulate.
 2. **Worker slot lease** is the run's time budget plus 300 s. A runner that
    dies frees its slot when the lease passes.
-3. **Timeout longer than the whole budget.** Case 27 says a runner never
-   starts a job whose timeout exceeds its time left. With the defaults
-   (timeout 120 s, tick 25 s) WP-Cron would then never run anything. So a
-   job whose timeout is at least the whole budget may run as a runner's
-   first job; after that, case 27 applies strictly.
+3. **Timeout longer than the whole budget (a departure from case 27).**
+   Case 27 says a runner never starts a job whose timeout exceeds its time
+   left. With the defaults (timeout 120 s, tick 25 s) WP-Cron would then
+   never run anything. So a runner's first job always starts, even when its
+   timeout is at least the whole budget; after the first job, case 27
+   applies strictly. The rule is "first job always starts" rather than
+   "first job whose timeout is at least the budget", so a job whose timeout
+   is just under the budget is not refused once housekeeping has used a
+   second of it. The PRD records the same departure under case 27. The
+   worker slot's lease is the longer of the budget and the longest
+   registered timeout plus 60 s, plus 300 s, so a long first job never
+   frees its slot to a third runner.
 4. **TTL counts from `run_after`,** not from the enqueue, so a delayed job
    cannot expire before it was allowed to run. `expires_at` overrides it.
 5. **Costs are written as they are reported.** Each `addCost()` adds to the
@@ -142,9 +156,12 @@ Where the PRD left a choice open, this is what was built and why.
 9. **`gen_queue_cap_reached`** fires the first time on a local day that the
    global cap stops a job (the estimate no longer fits), with one log line.
    The day is kept in `gen_queue_cap_notice_day`.
-10. **No cap set** stops the runner with reason `capped`, so `wp gen-queue
-    run` exits 4 and a shell loop treats it as a stop, not a finish. The
-    pre-spend check is never consulted (case 74).
+10. **No cap set, or a cap of 0,** stops the runner with reason `capped`
+    before any candidate is read, so `wp gen-queue run` exits 4 and a shell
+    loop treats it as a stop, not a finish. The pre-spend check is never
+    consulted (case 74). This holds on every entry point: the WP-Cron tick,
+    `wp gen-queue run` and `gen_queue_run()` all go through `Plugin::run()`
+    and `Runner::run()`, and nothing else calls a handler.
 11. **`enqueue_many` inserts one row per statement inside one transaction
     per batch of 500.** Reason: with MySQL's interleaved auto-increment mode
     (the default since 8.0) the ids of a multi-row insert are not
@@ -166,9 +183,15 @@ Where the PRD left a choice open, this is what was built and why.
 15. **Spend filter values.** A float is rounded up; a digit string is used;
     in both cases the larger of that and the queue's own sum wins. Anything
     else falls back to the queue's own sum with a warning.
-16. **Error text** is redacted (`Bearer ...`, `key=`, `token=`, `secret=`,
-    `password=`, `sk-...`) and cut to 500 bytes on a UTF-8 boundary before
-    it is stored or logged.
+16. **Error text** is redacted and cut to 500 bytes on a UTF-8 boundary
+    before it is stored or logged. Redacted: `Bearer`, `Basic` and `Token`
+    credentials; `user:password@` in URLs; any name ending in key, token,
+    secret, password, signature, credentials or authorization followed by
+    `=` or `:` (so `access_token=`, `x-api-key:` and `"client_secret":` are
+    caught, not only `key=`); and common key shapes (`sk-...`, cloud access
+    key ids, source-host tokens, chat tokens). Only messages of the queue's
+    own exceptions are stored at all; any other Throwable is stored as its
+    class name (ruling 3).
 17. **A failed schema check blocks running.** The error is stored in
     `gen_queue_install_error`, shown as an admin notice and on the status
     page, and every run stops with `disabled` until a reinstall verifies.
@@ -199,15 +222,51 @@ Where the PRD left a choice open, this is what was built and why.
 27. **Install check on page loads** uses the cached `get_option()` for the
     schema version and confirms with a fresh read only when it differs, so
     ordinary requests pay no extra query. Money and switch reads stay fresh.
+28. **Idle fast path (section 9).** A run first makes one read that returns
+    the database clock and whether any queued job is due, any lease has
+    expired, any queued job is past its expiry, and whether any job is
+    queued at all; then one read of the switch, cap and purge-day options.
+    If nothing is due, stale or (while switched on) expiring, and today's
+    purge has run, the run stops there with `disabled`, `capped`, `waiting`
+    or `empty`, in that order of precedence, and takes no lock. Measured on
+    MySQL 8.0 in the integration tests: a whole WP-Cron tick (tick seconds,
+    schema check, the two reads, the last-tick write) is 5 queries, inside
+    the budget of 6. A tick where jobs are due but none can run takes the
+    full path and costs more; the budget is for the idle case. The
+    last-tick time is the run's start clock plus elapsed seconds, which
+    saves a clock read.
+29. **Stale candidates never win a claim.** The candidate list is read
+    before the claim lock, so under the lock the runner re-reads the row's
+    cooldown and hold, and the claim `UPDATE` also requires the `attempts`
+    and `run_after` the row had when it was read. A job that another runner
+    ran, failed and put into backoff in between, or whose key started
+    cooling, is not claimed; the runner picks again.
+30. **A used-up cap stops at once.** When spent plus reserved already reach
+    the global cap (nothing fits, not even an estimate of 0), the runner
+    stops with `capped` instead of walking up to 1,000 queued jobs through
+    the claim lock on every tick. When a type's own cap is used up, that
+    type is left out of the candidate reads for the rest of the run and
+    other types carry on. A job whose estimate alone does not fit is still
+    skipped one by one, since a smaller job may fit.
+31. **Breaker and hold writes are serialised** through a `breakers` lock
+    row, so two runners failing on the same provider at once both count.
+    If the lock cannot be had within about a second the write goes ahead
+    without it and a warning is logged: losing a failure count is worse
+    than a rare overlapping write.
+32. **An account hold is written before the job goes back to the queue,**
+    so no other runner claims a job of the held group in between, and it
+    is written even when the lease was lost (the account error is real
+    either way).
 
 ## Testing
 
-- `tests/Unit`: 144 tests against the WordPress stub layer in
+- `tests/Unit`: 155 tests against the WordPress stub layer in
   `tests/stubs/` and the in-memory store. Each test names the PRD case it
   covers. spend-meter tests run in separate processes because they define
   `SPEND_METER_API`.
 - `tests/Integration`: the `$wpdb` store against a real MySQL or MariaDB,
-  through a small `wpdb` stand-in on mysqli: 9 tests, including four runner
-  processes draining one queue in parallel (every job runs exactly once).
+  through a small `wpdb` stand-in on mysqli: 10 tests, including four
+  runner processes draining one queue in parallel (every job runs exactly
+  once) and the empty-tick query budget (section 9).
   Skipped unless `GEN_QUEUE_TEST_DB_HOST` or `GEN_QUEUE_TEST_DB_SOCKET` is
   set. CI runs them against MySQL 8.0.

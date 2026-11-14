@@ -109,7 +109,8 @@ billionth of the operator's currency unit) and shown as a decimal.
 4. A type with a non-callable handler throws `RegistrationException`.
 5. Type defaults (each overridable per job where marked): `max_attempts` 5
    (job), `backoff_base` 30 s, `backoff_max` 3600 s, `timeout` 120 s,
-   `priority` 0 (job), `order` `fifo` (or `lifo`), `ttl` 7 days (job; 0 means
+   `priority` 0 (job), `order` `fifo` (the only order; see ruling 6 in
+   ARCHITECTURE.md), `ttl` 7 days (job; 0 means
    never expires), `group` the type name (job), `resource_key` the type name
    (job), `cost_estimate` 0 (job), `daily_cap` none, `meter` none (optional array
    with `purpose`, `provider` and `model`, used only by case 71 and 73).
@@ -153,8 +154,10 @@ billionth of the operator's currency unit) and shown as a decimal.
 ### 4.3 Claiming and running
 
 17. A runner first takes a worker slot: one of `max_workers` (default 2)
-    named database locks. If none is free it stops with reason `busy`, which
-    is distinct from `empty`.
+    lock rows in the plugin's own lock table (ruling 1 in ARCHITECTURE.md).
+    If none is free it stops with reason `busy`, which is distinct from
+    `empty`. When nothing is due at all the runner does not take a slot; it
+    reports `empty` or `waiting` (section 9).
 18. Before each job, the runner re-reads, bypassing every cache: the global
     kill switch, the per-type pause list, the daily cap and today's spend. A
     switch flipped mid-run stops the runner before its next job, even in a
@@ -165,8 +168,8 @@ billionth of the operator's currency unit) and shown as a decimal.
 21. The runner claims the next eligible job: status `queued`, `run_after` at
     or before now, not expired, type registered and not paused, resource key
     not cooling, group not on account hold, and the cap allows it (case 30).
-    Order: priority descending, then `run_after` ascending (or descending for
-    `lifo` types), then id.
+    Order: priority descending, then `run_after` ascending, then id (FIFO
+    within priority; ruling 6).
 22. The claim is atomic: a conditional update sets status `running`, a fresh
     lease token, `lease_until` (now plus the type timeout plus 60 s) and the
     worker id, only where status is still `queued`. If no row changed, another
@@ -186,7 +189,13 @@ billionth of the operator's currency unit) and shown as a decimal.
     attempt row is closed with outcome `success`, the resource key's failure
     count is cleared, and `gen_queue_completed` fires.
 27. A runner never starts a job whose timeout exceeds the time left in its
-    budget. It stops with reason `time`.
+    budget. It stops with reason `time`. One departure, decided in the build:
+    a runner's first job always starts, even when its timeout is at least
+    the whole run budget, because otherwise the default 120 s timeout would
+    never fit a 25 s WP-Cron tick and nothing would ever run there. After
+    the first job the rule applies strictly. The worker slot's lease covers
+    the longest registered timeout, so the slot is not freed under a long
+    first job.
 28. A runner stops after `--max` jobs with reason `max`, or when nothing is
     eligible with reason `empty` (queue empty) or `waiting` (jobs exist but
     all are in backoff, cooling, held, paused or capped).
@@ -237,8 +246,10 @@ billionth of the operator's currency unit) and shown as a decimal.
       handler cannot use, the target post no longer exists or is no longer
       in a state the handler can write to.
     - `AccountException`: authentication failure, forbidden, out of credit.
-    - Any other `Throwable` is treated as retryable with error class
-      `exception`, and the message is stored.
+    - Any other `Throwable` fails the job at once with error class
+      `exception`. Only the class name is stored, never the message (ruling 3
+      in ARCHITECTURE.md): it is a bug in the handler, retrying it may repeat
+      a paid call, and its message may carry data that must not be stored.
 39. Retryable, attempts left: the job returns to `queued` with
     `run_after = now + delay`. Delay is full jitter: a random value between 0
     and `min(backoff_max, backoff_base * 2^(attempt-1))`, but never less than
@@ -536,7 +547,10 @@ loop can tell a stop from a finish.
 
 ## 6. Data
 
-Two tables, created with `dbDelta` and verified afterwards (rule 14.9).
+Three tables, created with `dbDelta` and verified afterwards (rule 14.9):
+the two below and `{prefix}gen_queue_locks` (`name`, `owner`,
+`locked_until`), which holds the worker slots and the claim lock (ruling 1
+in ARCHITECTURE.md).
 
 **`{prefix}gen_queue_jobs`**
 
@@ -593,8 +607,8 @@ Indexes: unique (`type`, `idempotency_key`); (`status`, `priority`,
 Options (all non-autoloaded except the settings array):
 `gen_queue_enabled` ('1' or '0', default '1'), `gen_queue_daily_cap`
 (nanos or empty, default empty), `gen_queue_currency` (label, default
-empty), `gen_queue_paused_types` (list), `gen_queue_breakers` (per key:
-count and cooling-until), `gen_queue_holds` (per group: until and message),
+empty), `gen_queue_paused_types` (list), `gen_queue_breakers_<provider>`
+(one per provider, keyed by model: count and cooling-until; ruling 2), `gen_queue_holds` (per group: until and message),
 `gen_queue_settings` (autoloaded: `max_workers`, `tick_seconds`,
 `retention_days`, `cooldown_threshold`, `cooldown_seconds`,
 `account_hold`), `gen_queue_db_version`, `gen_queue_cap_notice_day`.
@@ -641,6 +655,10 @@ Constants override options.
 ## 9. Performance budget
 
 - Empty tick (nothing eligible): under 20 ms and at most 6 queries.
+  Measured in the integration tests: 5 queries for a WP-Cron tick when no
+  job is due, no lease has expired, nothing is due to expire and today's
+  purge has run. A tick where jobs are due but none can run (all cooling,
+  held, paused or capped) takes the full path and costs more.
 - Claim of one job: one select on the status index and one conditional
   update; under 10 ms on a table of 1,000,000 rows.
 - Spend check: one indexed sum on `cost_day` per job, or the filter's value.
@@ -652,8 +670,8 @@ Constants override options.
 
 ## 10. Compatibility
 
-- PHP 8.1, 8.2, 8.3. WordPress 6.4+. MySQL 5.7+ or MariaDB 10.4+ (named
-  locks via `GET_LOCK`, `utf8mb4`).
+- PHP 8.1, 8.2, 8.3. WordPress 6.4+. MySQL 5.7+ or MariaDB 10.4+
+  (`utf8mb4`). No `GET_LOCK`: locks are rows in the plugin's own table.
 - Works as a normal or must-use plugin. As a must-use plugin, tables are
   created on first load when the stored version is missing.
 - Persistent object caches: safe (case 68).
@@ -717,7 +735,8 @@ in-memory table double, plus integration tests against a real database in CI.
 25. (25) Context exposes attempt, deadline, cost, cancel and log.
 26. (26) Success stores the result, closes the attempt, clears the failure
     counter, fires `gen_queue_completed`.
-27. (27) A job with timeout longer than remaining time is not started.
+27. (27) A job with timeout longer than remaining time is not started,
+    except as the runner's first job.
 28. (28) Stop reasons `max`, `empty` and `waiting` are reported correctly.
 29. (29) With no cap set, and with cap 0, no job runs.
 30. (30) Cap check with estimate: a job that would exceed is left untouched.
@@ -730,8 +749,8 @@ in-memory table double, plus integration tests against a real database in CI.
 35. (35) Per-type cap stops that type only; the stricter cap wins.
 36. (36) `gen_queue_can_run` false vetoes; true cannot beat a reached cap.
 37. (37) `gen_queue_cap_reached` fires once per day.
-38. (38) Each exception class maps to its error class; a plain `Error` is
-    retryable.
+38. (38) Each exception class maps to its error class; a plain `Error`
+    fails the job with the class name only.
 39. (39) Backoff is within the jitter bounds, honours `retryAfter`, and the
     filter is clamped.
 40. (40) Last retryable attempt ends `failed`.
@@ -849,8 +868,9 @@ Each is a rule the build must follow.
 11. **A pause must keep its backlog.** Expiry is suspended while the queue is
     switched off, or the first tick after resuming sweeps a deliberately
     paused queue into the bin.
-12. **Freshest first when money is short.** Offer `lifo` order, so when the
-    cap bites the budget goes to new work and old backfill waits.
+12. **Freshest first when money is short.** Enqueue new work at a higher
+    priority than backfill, so when the cap bites the budget goes to new work
+    and old backfill waits (ruling 6 replaced a `lifo` order with this).
 13. **Failure counters are for eyes, not brakes.** Count chain-wide failures
     for the status page; never halt on them. Halting belongs to the cap, the
     switch, cooldowns and holds, each of which is visible and reversible.

@@ -108,7 +108,7 @@ Enqueue options also include `idempotency_key`, `on_conflict` (`return` or `requ
 ## How it works
 
 - **Storage.** Three tables: jobs, attempts (one row per run of a handler, with its cost and local day), and a small lock table. Settings and state are options. The schema is checked column by column after every install or upgrade.
-- **Runners.** A WP-Cron tick and `wp gen-queue run` use the same code. A runner takes one of `max_workers` slot rows; if none is free it stops with `busy`, which is never confused with `empty`.
+- **Runners.** A WP-Cron tick and `wp gen-queue run` use the same code. A runner takes one of `max_workers` slot rows; if none is free it stops with `busy`, which is never confused with `empty`. When nothing is due at all, a run makes two reads, takes no slot and stops with `empty` or `waiting` (5 queries for a whole idle WP-Cron tick).
 - **Fresh reads.** Before every job the runner reads the switch, the pause list, the cap and today's spend straight from the database, past any object cache.
 - **Claims.** Under a short claim lock the runner checks the global cap, the type cap, `gen_queue_can_run` and spend-meter, then claims the job with one conditional `UPDATE ... WHERE status = 'queued'`. No job runs twice at once.
 - **Attempt first.** The attempt is counted and written before the handler runs, so a fatal error cannot cause a paid retry loop. A deliberate stop (switch, pause) after the claim gives the attempt back.
