@@ -175,6 +175,24 @@ final class WpdbStore implements Store
         return $this->scalar("SELECT option_value FROM {$this->db->options} WHERE option_name = %s LIMIT 1", [$name]);
     }
 
+    public function getOptions(array $names): array
+    {
+        if ($names === []) {
+            return [];
+        }
+        [$list, $values] = self::in($names, '%s');
+        $rows = $this->db->get_results($this->prepare(
+            "SELECT option_name, option_value FROM {$this->db->options} WHERE option_name IN ($list)",
+            $values
+        ), ARRAY_A);
+        $this->check();
+        $out = [];
+        foreach (is_array($rows) ? $rows : [] as $row) {
+            $out[(string) $row['option_name']] = (string) $row['option_value'];
+        }
+        return $out;
+    }
+
     public function getOptionsLike(string $prefix): array
     {
         $rows = $this->db->get_results($this->prepare(
@@ -385,6 +403,31 @@ final class WpdbStore implements Store
     public function hasQueued(): bool
     {
         return $this->scalar("SELECT 1 FROM {$this->jobs} WHERE status = 'queued' LIMIT 1") !== null;
+    }
+
+    public function probe(): array
+    {
+        // UNIX_TIMESTAMP() and UTC_TIMESTAMP() read the same statement clock.
+        $rows = $this->db->get_results(
+            "SELECT UNIX_TIMESTAMP() AS now,
+                EXISTS(SELECT 1 FROM {$this->jobs} WHERE status = 'queued' AND run_after <= UTC_TIMESTAMP()) AS due,
+                EXISTS(SELECT 1 FROM {$this->jobs} WHERE status = 'running' AND lease_until < UTC_TIMESTAMP()) AS stale,
+                EXISTS(SELECT 1 FROM {$this->jobs} WHERE status = 'queued' AND expires_at <= UTC_TIMESTAMP()) AS expiring,
+                EXISTS(SELECT 1 FROM {$this->jobs} WHERE status = 'queued') AS queued",
+            ARRAY_A
+        );
+        $this->check();
+        $row = is_array($rows) ? ($rows[0] ?? null) : null;
+        if (!is_array($row) || !is_numeric($row['now'] ?? null)) {
+            throw new StorageException('Could not read the database clock.');
+        }
+        return [
+            'now' => (int) $row['now'],
+            'due' => (int) $row['due'] === 1,
+            'stale' => (int) $row['stale'] === 1,
+            'expiring' => (int) $row['expiring'] === 1,
+            'queued' => (int) $row['queued'] === 1,
+        ];
     }
 
     public function reservedNanos(?string $type = null): int

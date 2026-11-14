@@ -50,6 +50,14 @@ interface Store
     public function getOption(string $name): ?string;
 
     /**
+     * Several options in one read.
+     *
+     * @param list<string> $names
+     * @return array<string, string> option name => raw value, for the names that exist
+     */
+    public function getOptions(array $names): array;
+
+    /**
      * @return array<string, string> option name => raw value, for names starting with $prefix
      */
     public function getOptionsLike(string $prefix): array;
@@ -110,6 +118,16 @@ interface Store
     public function nextCandidates(int $now, array $types, array $exclude, int $limit): array;
 
     public function hasQueued(): bool;
+
+    /**
+     * One cheap read that tells an idle runner whether there is anything to
+     * do, with the database clock: any queued job due now, any running job
+     * whose lease has passed, any queued job past its expiry, any queued job
+     * at all.
+     *
+     * @return array{now: int, due: bool, stale: bool, expiring: bool, queued: bool}
+     */
+    public function probe(): array;
 
     /** Sum of estimate_nanos of running jobs, optionally of one type. */
     public function reservedNanos(?string $type = null): int;

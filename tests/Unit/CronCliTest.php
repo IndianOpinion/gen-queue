@@ -81,8 +81,17 @@ final class CronCliTest extends TestCase
         $this->assertSame('succeeded', $this->row($id)['status']);
 
         // Without --until-empty a busy run returns at once.
+        gen_queue_enqueue('demo.task', []);
         $this->store->acquireLock('worker-1', 'x', $until, $this->store->clock);
         $this->assertSame(['busy'], array_map(static fn ($s): string => $s->stopReason, $command->drain(['time' => 60], false)));
+
+        // With nothing due, held slots do not matter: the idle run says empty, not busy.
+        $this->store->releaseLock('worker-1', 'x');
+        $this->store->releaseLock('worker-2', 'y');
+        $command->drain(['time' => 60], false);
+        $this->store->acquireLock('worker-1', 'x', $until, $this->store->clock);
+        $this->store->acquireLock('worker-2', 'y', $until, $this->store->clock);
+        $this->assertSame(['empty'], array_map(static fn ($s): string => $s->stopReason, $command->drain(['time' => 60], false)));
     }
 
     /** Test 60, case 60: exit codes. */

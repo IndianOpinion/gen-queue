@@ -18,6 +18,7 @@ final class Breakers
 {
     public const OPT_PREFIX = 'gen_queue_breakers_';
     public const OPT_HOLDS = 'gen_queue_holds';
+    public const LOCK = 'breakers';
 
     public function __construct(private readonly Store $store, private readonly Controls $controls)
     {
@@ -83,17 +84,22 @@ final class Breakers
     /** A retryable failure on this key. Starts a cooldown at the threshold. */
     public function failure(string $key, int $now): void
     {
-        $state = $this->read($key);
-        $entry = $state[$key] ?? ['count' => 0, 'until' => 0];
-        $entry['count']++;
-        $started = false;
         $settings = $this->controls->settings();
-        if ($entry['count'] >= $settings['cooldown_threshold'] && $entry['until'] <= $now && $settings['cooldown_seconds'] > 0) {
-            $entry['until'] = $now + $settings['cooldown_seconds'];
-            $started = true;
-        }
-        $state[$key] = $entry;
-        $this->write($key, $state);
+        $started = false;
+        $entry = ['count' => 0, 'until' => 0];
+        // Read, change and write under a lock: two runners failing at once
+        // on the same provider must both be counted.
+        $this->locked(function () use ($key, $now, $settings, &$started, &$entry): void {
+            $state = $this->read($key);
+            $entry = $state[$key] ?? ['count' => 0, 'until' => 0];
+            $entry['count']++;
+            if ($entry['count'] >= $settings['cooldown_threshold'] && $entry['until'] <= $now && $settings['cooldown_seconds'] > 0) {
+                $entry['until'] = $now + $settings['cooldown_seconds'];
+                $started = true;
+            }
+            $state[$key] = $entry;
+            $this->write($key, $state);
+        });
         if ($started) {
             Log::notice(sprintf('Resource "%s" is cooling for %d s after %d consecutive failures.', $key, $settings['cooldown_seconds'], $entry['count']));
             do_action('gen_queue_cooldown_started', $key, $entry['until']);
@@ -103,12 +109,14 @@ final class Breakers
     /** A success on this key clears its counter. */
     public function success(string $key): void
     {
-        $state = $this->read($key);
-        if (!isset($state[$key])) {
+        if (!isset($this->read($key)[$key])) {
             return;
         }
-        unset($state[$key]);
-        $this->write($key, $state);
+        $this->locked(function () use ($key): void {
+            $state = $this->read($key);
+            unset($state[$key]);
+            $this->write($key, $state);
+        });
     }
 
     /** @return array<string, array{until: int, message: string}> */
@@ -135,12 +143,15 @@ final class Breakers
     /** Put a group on account hold. Logs and fires once per hold. */
     public function hold(string $group, int $now, string $message): void
     {
-        $holds = array_filter($this->holds(), static fn (array $h): bool => $h['until'] > $now);
         $seconds = $this->controls->setting('account_hold');
         $until = $now + $seconds;
-        $fresh = !isset($holds[$group]);
-        $holds[$group] = ['until' => max($until, $holds[$group]['until'] ?? 0), 'message' => $message];
-        $this->store->setOption(self::OPT_HOLDS, (string) json_encode($holds));
+        $fresh = false;
+        $this->locked(function () use ($group, $now, $until, $message, &$fresh): void {
+            $holds = array_filter($this->holds(), static fn (array $h): bool => $h['until'] > $now);
+            $fresh = !isset($holds[$group]);
+            $holds[$group] = ['until' => max($until, $holds[$group]['until'] ?? 0), 'message' => $message];
+            $this->store->setOption(self::OPT_HOLDS, (string) json_encode($holds));
+        });
         if ($fresh) {
             Log::warning(sprintf('Group "%s" is on account hold for %d s: %s', $group, $seconds, $message));
             do_action('gen_queue_account_hold', $group, $until, $message);
@@ -149,9 +160,42 @@ final class Breakers
 
     public function release(string $group): void
     {
-        $holds = $this->holds();
-        unset($holds[$group]);
-        $this->store->setOption(self::OPT_HOLDS, (string) json_encode($holds));
+        $this->locked(function () use ($group): void {
+            $holds = $this->holds();
+            unset($holds[$group]);
+            $this->store->setOption(self::OPT_HOLDS, (string) json_encode($holds));
+        });
+    }
+
+    /**
+     * Run a read-modify-write of breaker or hold state under the plugin's
+     * own lock row. If the lock cannot be had within about a second the
+     * change is made anyway: losing a failure count is worse than a rare
+     * overlapping write.
+     *
+     * @param \Closure(): void $change
+     */
+    private function locked(\Closure $change): void
+    {
+        $owner = 'breakers:' . bin2hex(random_bytes(6));
+        $held = false;
+        for ($i = 0; $i < 50 && !$held; $i++) {
+            $now = $this->store->now();
+            $held = $this->store->acquireLock(self::LOCK, $owner, $now + 10, $now);
+            if (!$held) {
+                usleep(20000);
+            }
+        }
+        if (!$held) {
+            Log::warning('Could not take the breaker lock within a second; writing without it.');
+        }
+        try {
+            $change();
+        } finally {
+            if ($held) {
+                $this->store->releaseLock(self::LOCK, $owner);
+            }
+        }
     }
 
     /** @return array<string, array{count: int, until: int}> */

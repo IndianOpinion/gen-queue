@@ -103,6 +103,18 @@ final class MemoryStore implements Store
         return $this->options[$name] ?? null;
     }
 
+    public function getOptions(array $names): array
+    {
+        $this->tick(__FUNCTION__);
+        $out = [];
+        foreach ($names as $name) {
+            if (isset($this->options[$name])) {
+                $out[$name] = $this->options[$name];
+            }
+        }
+        return $out;
+    }
+
     public function getOptionsLike(string $prefix): array
     {
         $this->tick(__FUNCTION__);
@@ -284,6 +296,22 @@ final class MemoryStore implements Store
             }
         }
         return false;
+    }
+
+    public function probe(): array
+    {
+        $this->tick(__FUNCTION__);
+        $out = ['now' => $this->clock, 'due' => false, 'stale' => false, 'expiring' => false, 'queued' => false];
+        foreach ($this->jobs as $job) {
+            if ($job['status'] === 'queued') {
+                $out['queued'] = true;
+                $out['due'] = $out['due'] || $job['run_after'] <= $this->clock;
+                $out['expiring'] = $out['expiring'] || ($job['expires_at'] !== null && $job['expires_at'] <= $this->clock);
+            } elseif ($job['status'] === 'running') {
+                $out['stale'] = $out['stale'] || ($job['lease_until'] !== null && $job['lease_until'] < $this->clock);
+            }
+        }
+        return $out;
     }
 
     public function reservedNanos(?string $type = null): int

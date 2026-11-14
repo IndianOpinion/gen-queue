@@ -48,6 +48,24 @@ final class Runner
         $worker = isset($opts['worker']) ? Validate::label($opts['worker'], 64, 'worker') : self::workerId();
         $this->meter->resetLog();
 
+        // The idle fast path: two reads when there is nothing to do (section 9).
+        $probe = $this->store->probe();
+        $this->clockAtStart = $probe['now'];
+        $raw = $this->store->getOptions([Controls::OPT_ENABLED, Controls::OPT_CAP, Controls::OPT_PURGE_DAY]);
+        $enabled = $this->controls->enabledFromRaw($raw[Controls::OPT_ENABLED] ?? null);
+        $idle = !$probe['due'] && !$probe['stale'] && !($enabled && $probe['expiring'])
+            && ($raw[Controls::OPT_PURGE_DAY] ?? null) === Days::local($probe['now']);
+        if ($idle) {
+            if (!$enabled) {
+                return $this->finish($summary, 'disabled', $started);
+            }
+            $cap = $this->controls->capFromRaw($raw[Controls::OPT_CAP] ?? null);
+            if ($cap === null || $cap === 0) {
+                return $this->finish($summary, 'capped', $started);
+            }
+            return $this->finish($summary, $probe['queued'] ? 'waiting' : 'empty', $started);
+        }
+
         $this->housekeeping->run($worker);
 
         if (!$this->controls->enabled()) {
@@ -58,7 +76,7 @@ final class Runner
             return $this->finish($summary, 'busy', $started);
         }
         try {
-            $reason = $this->loop($summary, $worker, $started + $time, $time, $max, $only);
+            $reason = $this->loop($summary, $worker, $started + $time, $max, $only);
         } finally {
             $this->store->releaseLock($slot, $worker);
         }
@@ -76,26 +94,46 @@ final class Runner
     {
         $summary->stopReason = $reason;
         $summary->seconds = microtime(true) - $started;
+        $this->finishedAt = $this->clockAtStart === null ? null : $this->clockAtStart + (int) round($summary->seconds);
         return $summary;
     }
 
-    /** One of max_workers slot rows, or null when all are held (busy). */
+    private ?int $clockAtStart = null;
+
+    private ?int $finishedAt = null;
+
+    /** Database time at which the last run finished (start clock plus elapsed time), or null. */
+    public function lastFinishedAt(): ?int
+    {
+        return $this->finishedAt;
+    }
+
+    /**
+     * One of max_workers slot rows, or null when all are held (busy). The
+     * slot lease covers the budget or the longest registered timeout,
+     * whichever is longer, since a run's first job may outlast the budget.
+     */
     private function takeSlot(string $worker, int $time): ?string
     {
         $now = $this->store->now();
         $workers = $this->controls->setting('max_workers');
+        $longest = $time;
+        foreach ($this->registry->all() as $type) {
+            $longest = max($longest, $type->timeout + 60);
+        }
         for ($i = 1; $i <= $workers; $i++) {
             $name = 'worker-' . $i;
-            if ($this->store->acquireLock($name, $worker, $now + $time + 300, $now)) {
+            if ($this->store->acquireLock($name, $worker, $now + $longest + 300, $now)) {
                 return $name;
             }
         }
         return null;
     }
 
-    private function loop(RunSummary $summary, string $worker, float $deadline, int $budget, ?int $max, ?string $only): string
+    private function loop(RunSummary $summary, string $worker, float $deadline, ?int $max, ?string $only): string
     {
         $skip = [];
+        $cappedTypes = [];
         $capped = false;
         while (true) {
             if ($max !== null && $summary->claimed >= $max) {
@@ -106,7 +144,8 @@ final class Runner
                 return 'disabled';
             }
             $cap = $this->controls->capNanos();
-            if ($cap === null) {
+            if ($cap === null || $cap === 0) {
+                // No cap means nothing runs (case 29, rule 14.16); never consult the meter (case 74).
                 return 'capped';
             }
             $now = $this->store->now();
@@ -117,7 +156,7 @@ final class Runner
             $candidates = [];
             if ($types !== []) {
                 $candidates = $this->store->nextCandidates($now, $types, [
-                    'paused' => $this->controls->pausedTypes(),
+                    'paused' => array_values(array_unique(array_merge($this->controls->pausedTypes(), $cappedTypes))),
                     'resources' => array_map('strval', array_keys($this->breakers->cooling($now))),
                     'groups' => array_map('strval', array_keys($this->breakers->activeHolds($now))),
                     'ids' => $skip,
@@ -136,9 +175,12 @@ final class Runner
                 if ($type === null) {
                     continue;
                 }
+                // Case 27, with one departure: a runner's first job always
+                // starts, even when its timeout is longer than the whole
+                // budget, or the default 120 s timeout would never fit a
+                // 25 s WP-Cron tick. After the first job the rule is strict.
                 $left = $deadline - microtime(true);
-                $firstOversized = $summary->claimed === 0 && $type->timeout >= $budget;
-                if ($type->timeout > $left && !$firstOversized) {
+                if ($summary->claimed > 0 && $type->timeout > $left) {
                     return 'time';
                 }
                 $result = $this->tryClaim($row, $type, $worker, $cap);
@@ -151,6 +193,14 @@ final class Runner
                         return 'busy';
                     case 'stop':
                         return 'disabled';
+                    case 'capped_all':
+                        // Spent and reserved already reach the cap: nothing else fits either.
+                        return 'capped';
+                    case 'type_capped':
+                        // This type's own cap is used up: skip its jobs for the rest of the run.
+                        $capped = true;
+                        $cappedTypes[] = $type->name;
+                        break 2;
                     case 'capped':
                         $capped = true;
                         $skip[] = (int) $row['id'];
@@ -198,13 +248,21 @@ final class Runner
             $reserved = $this->store->reservedNanos();
             if (!self::fits($spent + $reserved, $estimate, $cap)) {
                 $this->capReached($spent, $cap, $day);
-                return 'capped';
+                return self::fits($spent + $reserved, 0, $cap) ? 'capped' : 'capped_all';
             }
             if ($type->dailyCapNanos !== null) {
                 $typeUsed = $this->controls->typeSpend($day, $type->name) + $this->store->reservedNanos($type->name);
                 if (!self::fits($typeUsed, $estimate, $type->dailyCapNanos)) {
-                    return 'capped';
+                    return self::fits($typeUsed, 0, $type->dailyCapNanos) ? 'capped' : 'type_capped';
                 }
+            }
+            // The candidate list was read before this lock: a cooldown or an
+            // account hold may have started since. Re-read both for this row.
+            if (
+                $this->breakers->coolingUntil((string) $row['resource_key'], $now) !== null
+                || isset($this->breakers->activeHolds($now)[(string) $row['group_key']])
+            ) {
+                return 'lost';
             }
             $job = Job::fromRow($row);
             if (apply_filters('gen_queue_can_run', true, $job) !== true) {
@@ -224,7 +282,11 @@ final class Runner
                 'worker' => $worker,
                 'updated_at' => $now,
             ];
-            if ($this->store->updateJob((int) $row['id'], $set, ['status' => 'queued'], ['attempts' => 1]) !== 1) {
+            // Claim only the row as it was selected: a job that ran, failed
+            // and went back to the queue since has new attempts or a new
+            // run_after (backoff), so a stale candidate never wins.
+            $where = ['status' => 'queued', 'attempts' => (int) $row['attempts'], 'run_after' => (int) $row['run_after']];
+            if ($this->store->updateJob((int) $row['id'], $set, $where, ['attempts' => 1]) !== 1) {
                 return 'lost';
             }
             $row = array_merge($row, $set);
@@ -454,6 +516,11 @@ final class Runner
             $increment['cost_nanos'] = $total - $written;
         }
 
+        if ($outcome === 'account' && $error !== null) {
+            // Hold the group before the job goes back to the queue, so no
+            // other runner claims a job of this account in between.
+            $this->breakers->hold((string) $row['group_key'], $now, self::message($error));
+        }
         $changed = $this->store->updateJob($id, $set, ['status' => 'running', 'lease_token' => $token], $increment);
         if ($changed !== 1) {
             // The lease expired and the job was reclaimed. Keep the money, discard the rest.
@@ -491,7 +558,6 @@ final class Runner
                 break;
             case 'account':
                 $summary->retried++;
-                $this->breakers->hold($after->group, $now, self::message($error));
                 break;
             case 'permanent':
                 $summary->failed++;

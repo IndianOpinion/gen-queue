@@ -15,6 +15,7 @@ if (!class_exists('wpdb')) {
         public string $last_error = '';
         public int $insert_id = 0;
         public int $rows_affected = 0;
+        public int $num_queries = 0;
 
         public function __construct(private mysqli $db)
         {
@@ -54,6 +55,7 @@ if (!class_exists('wpdb')) {
 
         public function query(string $sql): int|bool
         {
+            $this->num_queries++;
             $this->last_error = '';
             $result = $this->db->query($sql);
             if ($result === false) {
@@ -73,6 +75,7 @@ if (!class_exists('wpdb')) {
         /** @return list<array<string, mixed>>|null */
         public function get_results(string $sql, string $output = 'OBJECT'): ?array
         {
+            $this->num_queries++;
             $this->last_error = '';
             $result = $this->db->query($sql);
             if ($result === false) {

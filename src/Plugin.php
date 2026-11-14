@@ -191,7 +191,8 @@ final class Plugin
             return $summary;
         }
         $summary = $this->runner->run($opts);
-        $this->controls->setJsonOption(Controls::OPT_LAST_TICK, ['at' => $this->store->now(), 'stop_reason' => $summary->stopReason]);
+        $at = $this->runner->lastFinishedAt() ?? $this->store->now();
+        $this->controls->setJsonOption(Controls::OPT_LAST_TICK, ['at' => $at, 'stop_reason' => $summary->stopReason]);
         return $summary;
     }
 

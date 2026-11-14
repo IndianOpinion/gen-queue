@@ -58,6 +58,12 @@ final class Controls
         return $this->store->getOption(self::OPT_ENABLED) !== '0';
     }
 
+    /** The kill switch from a raw option value read in a batch with others. */
+    public function enabledFromRaw(?string $raw): bool
+    {
+        return !$this->disabledByConstant() && $raw !== '0';
+    }
+
     public function disabledByConstant(): bool
     {
         return defined('GEN_QUEUE_DISABLED') && (bool) constant('GEN_QUEUE_DISABLED');
@@ -102,6 +108,18 @@ final class Controls
      */
     public function capNanos(): ?int
     {
+        return $this->resolveCap(fn (): ?int => $this->optionCap());
+    }
+
+    /** The cap from a raw option value read in a batch with others. */
+    public function capFromRaw(?string $raw): ?int
+    {
+        return $this->resolveCap(static fn (): ?int => self::parseCap($raw));
+    }
+
+    /** @param \Closure(): ?int $option */
+    private function resolveCap(\Closure $option): ?int
+    {
         if (defined('GEN_QUEUE_DAILY_CAP')) {
             $value = constant('GEN_QUEUE_DAILY_CAP');
             try {
@@ -111,7 +129,7 @@ final class Controls
                 return 0;
             }
         }
-        $option = $this->optionCap();
+        $option = $option();
         $filtered = apply_filters('gen_queue_daily_cap', $option);
         if ($filtered === null || (is_int($filtered) && $filtered >= 0)) {
             return $filtered;
@@ -127,7 +145,11 @@ final class Controls
 
     public function optionCap(): ?int
     {
-        $raw = $this->store->getOption(self::OPT_CAP);
+        return self::parseCap($this->store->getOption(self::OPT_CAP));
+    }
+
+    private static function parseCap(?string $raw): ?int
+    {
         if ($raw === null || $raw === '' || preg_match('/^\d+$/', $raw) !== 1) {
             return null;
         }

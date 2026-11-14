@@ -240,4 +240,23 @@ final class WpdbStoreTest extends TestCase
         $this->assertSame(['jobs' => [], 'attempts' => [], 'locks' => []], $this->store->columns());
         $this->assertSame([], $this->store->getOptionsLike('gen_queue_'));
     }
+
+    /**
+     * Section 9: an empty WP-Cron tick (nothing due, no stale lease, nothing
+     * to expire, purge already done today) costs at most 6 queries.
+     */
+    public function testEmptyTickStaysInsideTheQueryBudget(): void
+    {
+        global $wpdb;
+        $this->plugin->queue->setCap('5');
+        $this->plugin->registry->register('it.idle', static fn (): array => []);
+        gen_queue_enqueue('it.idle', [], ['run_after' => $this->store->now() + 3600]);
+        $this->plugin->tick();
+        $before = $wpdb->num_queries;
+        $summary = $this->plugin->tick();
+        $used = $wpdb->num_queries - $before;
+        $this->assertNotNull($summary);
+        $this->assertSame('waiting', $summary->stopReason);
+        $this->assertLessThanOrEqual(6, $used, sprintf('An empty tick used %d queries.', $used));
+    }
 }
