@@ -1,0 +1,24 @@
+parameters:
+    level: 8
+    paths:
+        - src
+        - gen-queue.php
+        - autoload.php
+        - uninstall.php
+    scanFiles:
+        - vendor/php-stubs/wordpress-stubs/wordpress-stubs.php
+        - vendor/php-stubs/wp-cli-stubs/wp-cli-stubs.php
+    bootstrapFiles:
+        - tests/phpstan-bootstrap.php
+    # Public functions validate their input at run time, whatever the PHPDoc says.
+    treatPhpDocTypesAsCertain: false
+    ignoreErrors:
+        # Table names come from $wpdb->prefix, so the SQL is not a literal string;
+        # every value still goes through prepare() placeholders.
+        -
+            message: '#^Parameter \#1 \$query of method wpdb::prepare\(\) expects literal-string, string given\.$#'
+            path: src/Storage/WpdbStore.php
+        # wp-admin/includes/upgrade.php exists in a WordPress install, not in this repository.
+        -
+            identifier: requireOnce.fileNotFound
+            path: src/Storage/WpdbStore.php
