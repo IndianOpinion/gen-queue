@@ -65,6 +65,15 @@ Non-goals:
 - No REST API in 0.1.0 (see section 13).
 - No cross-site queue on multisite. Each site has its own queue.
 
+README requirement: the README of this repository carries this exact line
+in its first section: "Written from scratch; not derived from any
+third-party plugin." It also carries the brief's sentence that the project
+came out of the work on indianopinion.org and is independent of any
+third-party plugin it integrates with. Its quick start and its configuration
+table say, in plain words, that **with no daily cap set, nothing runs**, and
+give the one command that sets it (`wp gen-queue cap <amount>`). Its FAQ has
+an entry "Why is nothing running?" that starts with the missing cap.
+
 ## 3. Users and setting
 
 - **Plugin developers** who need bulk generation: summaries, translations,
@@ -84,8 +93,8 @@ handler on a job. A **runner** is one process draining the queue (a WP-Cron
 tick or a CLI command). A **resource key** is a string the type or job
 declares (for example a model name) that the cooldown is kept against. A
 **group** is a string that ties several types to one account, so an account
-error holds all of them. Money is held as integer micro-units (one
-millionth of the operator's currency unit) and shown as a decimal.
+error holds all of them. Money is held as integer nanos (one
+billionth of the operator's currency unit) and shown as a decimal.
 
 ### 4.1 Registration
 
@@ -102,7 +111,8 @@ millionth of the operator's currency unit) and shown as a decimal.
    (job), `backoff_base` 30 s, `backoff_max` 3600 s, `timeout` 120 s,
    `priority` 0 (job), `order` `fifo` (or `lifo`), `ttl` 7 days (job; 0 means
    never expires), `group` the type name (job), `resource_key` the type name
-   (job), `cost_estimate` 0 (job), `daily_cap` none.
+   (job), `cost_estimate` 0 (job), `daily_cap` none, `meter` none (optional array
+   with `purpose`, `provider` and `model`, used only by case 71 and 73).
 
 ### 4.2 Enqueue
 
@@ -185,7 +195,8 @@ millionth of the operator's currency unit) and shown as a decimal.
 
 29. The global daily cap is an amount the operator sets. **Default: unset.
     With no cap set, no job runs** and the status page says so. A cap of 0 is
-    also valid and also runs nothing. The queue fails closed on money.
+    also valid and also runs nothing. The queue fails closed on money. A cap on
+    another meter, or no cap there, never stands in for this one (case 74).
 30. Before claiming a job the runner computes, under the claim lock:
     `spent_today + reserved + estimate <= cap`, where `spent_today` comes from
     the filter in case 34, `reserved` is the sum of estimates of jobs
@@ -203,11 +214,12 @@ millionth of the operator's currency unit) and shown as a decimal.
     midnight.
 34. `spent_today` is `apply_filters('gen_queue_spend_today', $own, $day)`,
     where `$own` is the sum of today's attempt costs in the queue's own
-    records. spend-meter, when active, may answer with its site-wide figure.
-    If the filter returns something other than a non-negative integer, the
-    queue logs a warning and uses the larger of `$own` and the returned value
-    cast safely; if the cast fails it uses `$own`. A broken integration never
-    lowers the figure.
+    records, in nanos. Any plugin may hook it to supply a wider figure.
+    spend-meter does not need to: its site-wide caps reach the queue through
+    the pre-spend check (case 71). If the filter returns something other than
+    a non-negative integer, the queue logs a warning and uses the larger of
+    `$own` and the returned value cast safely; if the cast fails it uses
+    `$own`. A broken integration never lowers the figure.
 35. A type may set its own `daily_cap`. Both caps apply; the stricter one
     wins. A per-type cap counts only that type's attempts.
 36. The filter `gen_queue_can_run` gets the last word: it may veto a job
@@ -329,6 +341,49 @@ millionth of the operator's currency unit) and shown as a decimal.
     (default 30) are purged in batches of 1000. Queued and running jobs are
     never purged. 0 means keep forever.
 
+### 4.10 spend-meter integration
+
+spend-meter is optional. It is present when the constant `SPEND_METER_API`
+is defined. gen-queue uses only its documented filter and action, never its
+functions. Money crosses the boundary in nanos, which both plugins use.
+
+71. **Pre-spend.** After the kill switch, the own cap and the per-type cap
+    allow a job (cases 29 to 35), and while spend-meter is present, the
+    runner applies the filter `spend_meter_pre_spend` with `null` and a dry
+    run intent: `purpose` is the type's `meter` purpose, else the type name
+    made to fit `^[a-z0-9][a-z0-9_.-]{0,63}$` (lower case, other characters
+    to `-`, cut to 64); `caller` and `provider` are `gen-queue` unless the
+    type's `meter` sets `provider`; `model` is the type's `meter` model, else
+    `job`; `estimate_override` is the job's `estimate_nanos`; `dry_run` is
+    true; `meta` holds `job_id`. The runner takes no reservation, because the
+    handler's own provider call reserves through the same filter.
+72. **Reading the decision.** A `null` result means no meter: carry on. A
+    decision with `allowed` true: carry on. Anything else is a deny, and the
+    job stays `queued`, untouched, no attempt used: `allowed` false, a
+    missing or malformed decision, an unknown reason code, a thrown error.
+    The reason `kill_switch` stops the runner with `disabled`; every other
+    reason skips the job and counts it as capped. The reason code is logged
+    once per event and shown on the status page. This path fails closed,
+    unlike the spend filter in case 34, because it guards money.
+73. **Recording.** For each cost record with `metered` false, while
+    spend-meter is present, gen-queue fires `do_action('spend_meter_record',
+    $call)` once, after the attempt row is written. `$call` holds `purpose`,
+    `caller` and `provider` and `model` as in case 71; `provider_cost`
+    (the record's `amount_nanos`); `input_tokens` and `output_tokens` (the
+    record's `input_units` and `output_units`); `status` `ok` for a
+    successful attempt, else `error_billed`; `attempt`; `call_id`; and `meta`
+    with `job_id`. A record with amount 0 is not forwarded. When `metered` is
+    true the handler already recorded the call through spend-meter, so
+    gen-queue forwards nothing, and `usage_ref` holds the `call_id` or
+    `reservation_id` the handler used, for tracing. `call_id` is the
+    record's `usage_ref` when it is a UUID; otherwise gen-queue sends a UUID
+    it generates and keeps the original in `meta` under `usage_ref`. The
+    action `gen_queue_cost_recorded` fires after the forward and is the
+    queue's own hook for other listeners.
+74. **No cap still means nothing runs.** With spend-meter present, a job
+    whose own cap is unset or 0 does not run, whatever the pre-spend check
+    would say. The pre-spend check is never consulted for it.
+
 ## 5. Public interface
 
 The contract below is stable from 0.1.0. Additions are minor versions;
@@ -367,7 +422,7 @@ thin wrappers so callers can test with `function_exists()`.
 | `gen_queue_stats(int $days = 7)` | array | counts and spend per day and type |
 
 Amounts are accepted as decimal strings or numbers and converted to
-micro-units with half-up rounding; negative amounts throw
+nanos with half-up rounding; negative amounts throw
 `InvalidArgumentException`.
 
 ### 5.3 Objects
@@ -412,7 +467,7 @@ micro-units with half-up rounding; negative amounts throw
 | `gen_queue_tick_finished` | `RunSummary $summary` |
 
 The cost record: `job_id`, `attempt`, `type`, `group`, `resource_key`,
-`amount` (decimal string), `amount_micros` (int), `currency` (operator
+`amount` (decimal string), `amount_nanos` (int), `currency` (operator
 label), `day` (Y-m-d local), `input_units`, `output_units`, `usage_ref`,
 `metered`, `recorded_at` (UTC).
 
@@ -421,8 +476,8 @@ label), `day` (Y-m-d local), `input_units`, `output_units`, `usage_ref`,
 | filter | default | purpose |
 |---|---|---|
 | `gen_queue_enqueue_job` | null | soft enqueue (5.1) |
-| `gen_queue_spend_today` | own sum (int micros) | spend-meter supplies site-wide spend |
-| `gen_queue_daily_cap` | option value (int micros or null) | read only after the constant |
+| `gen_queue_spend_today` | own sum (int nanos) | another plugin supplies a wider spend figure |
+| `gen_queue_daily_cap` | option value (int nanos or null) | read only after the constant |
 | `gen_queue_can_run` | true | veto a job; cannot loosen switch or cap |
 | `gen_queue_backoff_delay` | computed seconds | change a retry delay |
 | `gen_queue_payload_max_bytes` | 65536 | payload limit |
@@ -433,21 +488,22 @@ label), `day` (Y-m-d local), `input_units`, `output_units`, `usage_ref`,
 
 ### 5.6 spend-meter integration (soft)
 
-gen-queue never requires spend-meter and never calls its functions. The two
-meet only through hooks:
+Behaviour is in section 4.10. The names below are spend-meter's own, from its
+contract version 1.
 
-1. spend-meter may hook `gen_queue_spend_today` and return the day's total
-   spend in micro-units across everything it meters. The global cap then
-   covers all metered spend on the site, not only queued jobs. The status
-   page says which source the figure came from ("own records" or "external
-   meter"), using whether the filter changed the value.
-2. spend-meter may listen to `gen_queue_cost_recorded` and write its own
-   ledger row. A record with `metered` true was already recorded by the
-   caller's meter (for example an LLM call made through a metered client);
-   spend-meter must not count it twice and may match on `usage_ref`.
-3. Per-type caps (case 35) always use gen-queue's own records.
-4. Without spend-meter, both hooks have no listeners and the queue is
-   complete on its own.
+1. Pre-spend: filter `spend_meter_pre_spend`, `null` and an intent array in,
+   a decision array (`allowed`, `reason`, `message`, `reservation_id`,
+   `estimate`, `remaining`, `api`) or `null` out. gen-queue always sends
+   `dry_run` true.
+2. Record: action `spend_meter_record` with one call array (`provider_cost`
+   in nanos, `status`, `call_id`, `meta` and the keys in case 73).
+3. The gen-queue hooks `gen_queue_spend_today` and `gen_queue_cost_recorded`
+   are gen-queue's own. spend-meter does not need to listen to either. A
+   record's `metered` and `usage_ref` fields exist so that a call already
+   recorded by the caller's meter is never recorded twice.
+4. Per-type caps (case 35) always use gen-queue's own records.
+5. Without spend-meter, nothing is applied or fired and the queue is
+   complete on its own, with its own cap and switch.
 
 ### 5.7 WP-CLI
 
@@ -502,8 +558,8 @@ Two tables, created with `dbDelta` and verified afterwards (rule 14.9).
 | `lease_token` | char(32) null | |
 | `lease_until` | datetime null | |
 | `worker` | varchar(64) null | |
-| `estimate_micros` | bigint unsigned | |
-| `cost_micros` | bigint unsigned | sum over attempts |
+| `estimate_nanos` | bigint unsigned | |
+| `cost_nanos` | bigint unsigned | sum over attempts |
 | `cancel_requested` | tinyint | |
 | `result` | longtext null | JSON, up to 16 KiB |
 | `last_error` | varchar(500) null | truncated |
@@ -524,7 +580,7 @@ Indexes: unique (`type`, `idempotency_key`); (`status`, `priority`,
 | `attempt_no` | smallint unsigned | |
 | `type`, `group_key`, `resource_key` | as above | copied for reporting |
 | `outcome` | varchar(16) | started, success, retry, failed, permanent, account, abandoned, skipped, cancelled |
-| `cost_micros` | bigint unsigned | |
+| `cost_nanos` | bigint unsigned | |
 | `cost_day` | date | local day, indexed with `type` |
 | `input_units`, `output_units` | bigint unsigned | as reported |
 | `usage_ref` | varchar(191) null | |
@@ -536,7 +592,7 @@ Indexes: unique (`type`, `idempotency_key`); (`status`, `priority`,
 
 Options (all non-autoloaded except the settings array):
 `gen_queue_enabled` ('1' or '0', default '1'), `gen_queue_daily_cap`
-(micro-units or empty, default empty), `gen_queue_currency` (label, default
+(nanos or empty, default empty), `gen_queue_currency` (label, default
 empty), `gen_queue_paused_types` (list), `gen_queue_breakers` (per key:
 count and cooling-until), `gen_queue_holds` (per group: until and message),
 `gen_queue_settings` (autoloaded: `max_workers`, `tick_seconds`,
@@ -619,7 +675,7 @@ Constants override options.
   on account hold, or when WP-Cron has not ticked for 10 minutes.
 - Log lines through `error_log` with the prefix `[gen-queue]`, once per
   event, never once per job in a loop: cooldown start, account hold, cap
-  reached, filter misbehaviour, stale completion discarded.
+  reached, pre-spend denial, filter misbehaviour, stale completion discarded.
 - Daily failure counters per type, for observability only. Nothing halts on
   them.
 - `wp gen-queue status --format=json` for monitoring.
@@ -726,6 +782,17 @@ in-memory table double, plus integration tests against a real database in CI.
 74. (6) Uninstall drops tables and options; deactivation keeps them.
 75. (14.9) After an upgrade that adds a column, the installer verifies the
     column exists and reports failure if not.
+76. (71) With a stub for `spend_meter_pre_spend`, the intent has the exact
+    keys, `dry_run` true and `estimate_override` equal to the estimate in
+    nanos; a type name with odd characters becomes a valid purpose.
+77. (72) Decisions `null`, allowed, `cap_site_day`, `kill_switch`, an unknown
+    code, a malformed array and a thrown error: carry on, carry on, skip,
+    stop `disabled`, skip, skip, skip. Skipped jobs keep their attempts.
+78. (73) With a stub on `spend_meter_record`, an unmetered record forwards
+    once with the keys in case 73; a metered record and a zero record forward
+    nothing; a non-UUID `usage_ref` is replaced and kept in `meta`.
+79. (74) With the stub present and allowing everything, no cap and cap 0 run
+    nothing, and the stub is never called.
 
 ## 13. Open questions
 
@@ -740,8 +807,9 @@ For the builder to answer in `docs/ARCHITECTURE.md`:
    permanent? Retrying a programming error wastes attempts but never money,
    since nothing was called.
 4. A read-only REST endpoint for monitoring in 0.2.0?
-5. The exact hook names spend-meter will listen on must match its PRD once
-   merged. If they differ, gen-queue keeps its names and spend-meter adapts.
+5. The spend-meter names in section 4.10 follow its merged PRD, contract
+   version 1. Confirm them against the released plugin. Should the pre-spend
+   dry run prove too coarse for a type, is a per-type opt-out worth adding?
 6. Should `lifo` order be available per job, or only per type?
 7. Network-wide cap on multisite: wanted, and how is spend aggregated?
 
@@ -791,3 +859,11 @@ Each is a rule the build must follow.
 15. **The queue never publishes.** Handlers write drafts or suggestions for a
     human to accept. A queue that can publish on its own will one day publish
     a thousand bad posts overnight.
+16. **No cap means no spend.** An unset cap is not "unlimited". The queue
+    runs nothing until the operator sets a number, says so on the status page
+    and in an admin notice, and ignores a meter that has no cap either. A
+    default of unlimited is how a bulk job drains an account overnight.
+17. **One ledger row per call, from one writer.** When a queue and a meter
+    both see a cost, the handler that made the call records it and says so
+    (`metered`); the queue forwards only what nobody else recorded, with a
+    stable id, so a retry never counts twice.
