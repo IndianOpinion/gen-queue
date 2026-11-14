@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<ruleset name="gen-queue">
+    <description>PSR-12 for gen-queue.</description>
+    <file>src</file>
+    <file>tests</file>
+    <file>examples</file>
+    <file>gen-queue.php</file>
+    <file>autoload.php</file>
+    <file>uninstall.php</file>
+    <arg name="extensions" value="php"/>
+    <arg name="colors"/>
+    <arg value="sp"/>
+
+    <rule ref="PSR12">
+        <!-- The stub layer and the plugin entry files declare functions on purpose. -->
+        <exclude name="PSR1.Files.SideEffects.FoundWithSymbols"/>
+    </rule>
+    <rule ref="Generic.Files.LineLength">
+        <properties>
+            <property name="lineLimit" value="200"/>
+            <property name="absoluteLineLimit" value="0"/>
+        </properties>
+    </rule>
+    <rule ref="PSR1.Classes.ClassDeclaration.MultipleClasses">
+        <exclude-pattern>tests/stubs/*</exclude-pattern>
+    </rule>
+    <!-- WordPress names: the stub layer and the wpdb stand-in for integration tests. -->
+    <rule ref="PSR1.Methods.CamelCapsMethodName.NotCamelCaps">
+        <exclude-pattern>tests/stubs/*</exclude-pattern>
+        <exclude-pattern>tests/Integration/MysqliWpdb.php</exclude-pattern>
+    </rule>
+    <!-- The stub layer stands in for WordPress's own global WP_Error class. -->
+    <rule ref="PSR1.Classes.ClassDeclaration.MissingNamespace">
+        <exclude-pattern>tests/stubs/*</exclude-pattern>
+        <exclude-pattern>tests/Integration/MysqliWpdb.php</exclude-pattern>
+    </rule>
+    <rule ref="Squiz.Classes.ValidClassName.NotCamelCaps">
+        <exclude-pattern>tests/stubs/*</exclude-pattern>
+        <exclude-pattern>tests/Integration/MysqliWpdb.php</exclude-pattern>
+    </rule>
+</ruleset>
